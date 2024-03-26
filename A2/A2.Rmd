@@ -1,0 +1,59 @@
+---
+title: "A2"
+output: pdf_document
+date: "2024-03-26"
+---
+
+```{r}
+# Create a data frame to represent edges based on seat adjacency
+edges <- data.frame(
+  from = c('1', '2', '2', '3', '3', '3', '3', '3', '4', '4', '5', '5', '5', '6', '6', '6', 'A', 'A', 'A', 'B', 'B', 'B', 'B', 'B', 'C', 'C', 'C', 'C', 'C', 'D', 'D', 'D', 'D', 'D'),
+  to = c('2', '1', 'A', '2', '4', 'B', 'C', '5', '3', '5', '4', '6', 'D', '5', 'B', 'D', '2', 'B', 'C', 'A', '3', 'C', 'D', '6', 'B', '4', 'D', '3', '5', 'C', 'B', '6', '5', '3')
+)
+
+
+# Print the dataset
+print(edges)
+```
+
+```{r}
+library(igraph)
+# Create the graph from the edge data frame
+bus_network <- graph_from_data_frame(edges, directed = FALSE)
+
+# Calculate the centrality measures
+degree_centrality <- degree(bus_network, v = V(bus_network), normalized = TRUE)
+closeness_centrality <- closeness(bus_network, v = V(bus_network), normalized = TRUE)
+betweenness_centrality <- betweenness(bus_network, v = V(bus_network), normalized = TRUE)
+
+# Print the centrality measures for seats A-D
+seats <- c('A', 'B', 'C', 'D')
+centrality_measures <- data.frame(
+  seat = seats,
+  degree = degree_centrality[seats],
+  closeness = closeness_centrality[seats],
+  betweenness = betweenness_centrality[seats]
+)
+
+print(centrality_measures)
+
+
+```
+Seat B has the highest degree centrality, suggesting it has the most direct connections. Seat B might be beneficial if you want to be a key connector or bridge within the network since it has the highest betweenness centrality.Being in a seat that is central to many interactions can lead to frequent interruptions, making it difficult to read, think, or relax.
+
+```{r}
+# Create a layout 
+layout <- layout_nicely(bus_network)
+
+# Plot the network
+plot(bus_network, layout = layout, 
+     vertex.label = V(bus_network)$name, # Label nodes with their names
+     vertex.size = degree_centrality * 50, # Adjust vertex size based on degree centrality for visualization
+     main = "Bus Network Graph with Centrality Measures")
+
+# Adding centrality values as labels next to the nodes
+text(layout, labels = paste("D:", round(degree_centrality, 2), "\nC:", round(closeness_centrality, 2), "\nB:", round(betweenness_centrality, 2)), pos = 4, cex = 0.8)
+
+```
+
+
