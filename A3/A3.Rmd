@@ -1,0 +1,454 @@
+---
+title: "A3"
+output: pdf_document
+date: "2024-04-01"
+---
+
+```{r}
+library(readr)
+library(tidyverse)
+library(igraph)
+library(gender)
+library(lubridate)
+library(dplyr)
+library(gtsummary)
+library(arrow)
+library(tidyr)
+library(zoo)
+
+```
+```{r}
+data_path <- "/Users/apple/Desktop/Network Analysis/A3/672_project_data/"
+applications <- read_parquet(paste0(data_path,"app_data_sample.parquet"))
+edges <- read_csv(paste0(data_path,"edges_sample.csv"))
+
+```
+```{r}
+#check missing values in name columns 
+sum(is.na(applications$examiner_name_first))
+sum(is.na(applications$examiner_name_last))
+
+```
+```{r}
+# get a list of first names without repetitions
+examiner_names <- applications %>% 
+  distinct(examiner_name_first)
+
+examiner_names
+```
+```{r}
+#Gender
+# get a table of names and gender
+examiner_names_gender <- examiner_names %>% 
+  do(results = gender(.$examiner_name_first, method = "ssa")) %>% 
+  unnest(cols = c(results), keep_empty = TRUE) %>% 
+  select(
+    examiner_name_first = name,
+    gender,
+    proportion_female
+  )
+
+examiner_names_gender
+```
+```{r}
+# remove extra colums from the gender table
+examiner_names_gender <- examiner_names_gender %>% 
+  select(examiner_name_first, gender)
+
+# joining gender back to the dataset
+applications <- applications %>% 
+  left_join(examiner_names_gender, by = "examiner_name_first")
+
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+```
+
+```{r}
+#Race
+examiner_surnames <- applications %>% 
+  select(surname = examiner_name_last) %>% 
+  distinct()
+
+examiner_surnames
+```
+```{r}
+library(wru)
+```
+
+```{r}
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>% 
+  as_tibble()
+examiner_race
+```
+```{r}
+# pick the race category that has the highest probability for each last name
+examiner_race <- examiner_race %>% 
+  mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>% 
+  mutate(race = case_when(
+    max_race_p == pred.asi ~ "Asian",
+    max_race_p == pred.bla ~ "black",
+    max_race_p == pred.his ~ "Hispanic",
+    max_race_p == pred.oth ~ "other",
+    max_race_p == pred.whi ~ "white",
+    TRUE ~ NA_character_
+  ))
+
+examiner_race
+```
+```{r}
+#Join back to application table
+# removing extra columns
+examiner_race <- examiner_race %>% 
+  select(surname,race)
+
+applications <- applications %>% 
+  left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+```
+
+```{r}
+#Tenure
+library(lubridate) # to work with dates
+
+examiner_dates <- applications %>% 
+  select(examiner_id, filing_date, appl_status_date) 
+
+examiner_dates
+```
+```{r}
+examiner_dates <- examiner_dates %>% 
+  mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date)))
+```
+
+```{r}
+#identify the earliest and the latest date for each examiner and calculate the difference in days, which is their tenure in the organization.
+examiner_dates <- examiner_dates %>% 
+  group_by(examiner_id) %>% 
+  summarise(
+    earliest_date = min(start_date, na.rm = TRUE), 
+    latest_date = max(end_date, na.rm = TRUE),
+    tenure_days = interval(earliest_date, latest_date) %/% days(1)
+    ) %>% 
+  filter(year(latest_date)<2018)
+
+examiner_dates
+```
+```{r}
+#join back to application table
+applications <- applications %>% 
+  left_join(examiner_dates, by = "examiner_id")
+
+rm(examiner_dates)
+gc()
+```
+
+```{r}
+# Filter the data for workgroup 1 and workgroup 2
+workgroup1 <- applications %>%
+  filter(substr(examiner_art_unit, 1, 3) == "160")
+
+workgroup2 <- applications %>%
+  filter(substr(examiner_art_unit, 1, 3) == "170")
+#155 observations in group 1, 45 obs in group 2.
+```
+
+```{r}
+names(workgroup1)
+```
+
+```{r}
+# Count the number of employees in workgroup 1, grouped by gender and race
+employee_count <- workgroup1 %>%
+  group_by(gender, race) %>%
+  summarise(count = n_distinct(examiner_id), .groups = 'drop')
+ggplot(employee_count, aes(x = race, y = count, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Employee Count by Gender and Race in Workgroup 1",
+       x = "Race",
+       y = "Count") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
+
+```{r}
+# Count the number of employees in workgroup 1, grouped by gender and race
+employee_count_2 <- workgroup2 %>%
+  group_by(gender, race) %>%
+  summarise(count = n_distinct(examiner_id), .groups = 'drop')
+ggplot(employee_count_2, aes(x = race, y = count, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Employee Count by Gender and Race in Workgroup 1",
+       x = "Race",
+       y = "Count") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+In every group, the number of male and female employee is sumilar, and the majority of employees are white. This shows a trend of white being the dominant demographic across thses two workgroups.
+
+
+```{r}
+# Calculate average tenure days by race and gender
+average_tenure_by_race_gender <- workgroup1 %>%
+  group_by(race, gender) %>%
+  summarise(average_tenure_days = mean(tenure_days, na.rm = TRUE)) %>%
+  ungroup()
+
+# Plotting
+ggplot(average_tenure_by_race_gender, aes(x = race, y = average_tenure_days, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Average Tenure Days by Race and Gender for Group 1",
+       x = "Race",
+       y = "Average Tenure Days") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+# Calculate average tenure days by race and gender
+average_tenure_by_race_gender_2 <- workgroup2 %>%
+  group_by(race, gender) %>%
+  summarise(average_tenure_days = mean(tenure_days, na.rm = TRUE)) %>%
+  ungroup()
+
+# Plotting
+ggplot(average_tenure_by_race_gender_2, aes(x = race, y = average_tenure_days, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Average Tenure Days by Race and Gender for Group 2",
+       x = "Race",
+       y = "Average Tenure Days") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r}
+average_tenure_by_race_gender
+average_tenure_by_race_gender_2
+```
+
+The analysis of tenure between these two workgroups reveals a consistent pattern across different demographics, with the average tenure approximating 5000 days. This suggests that factors such as gender and race do not significantly impact the length of tenure within these groups. Furthermore, an examination within each group highlights a similarity in average tenure, reinforcing the conclusion that these demographic variables do not influence tenure durations in a meaningful way.
+
+```{r}
+
+# Calculating the total number of applications and the number of people per gender and race
+workload_summary <- workgroup1 %>%
+  group_by(gender, race) %>%
+  summarise(total_applications = n_distinct(application_number),
+            total_people = n_distinct(examiner_id), .groups = 'drop') %>%
+  mutate(average_workload_per_person = total_applications / total_people)
+
+# Plotting the average workload per person by gender and race
+ggplot(workload_summary, aes(x = race, y = average_workload_per_person, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme_minimal() +
+  labs(title = "Average Workload per Person by Gender and Race in Group 1",
+       x = "Race",
+       y = "Average Workload per Person") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+```{r}
+# Calculating the total number of applications and the number of people per gender and race
+workload_summary_2 <- workgroup2 %>%
+  group_by(gender, race) %>%
+  summarise(total_applications = n_distinct(application_number),
+            total_people = n_distinct(examiner_id), .groups = 'drop') %>%
+  mutate(average_workload_per_person = total_applications / total_people)
+
+# Plotting the average workload per person by gender and race
+ggplot(workload_summary_2, aes(x = race, y = average_workload_per_person, fill = gender)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme_minimal() +
+  labs(title = "Average Workload per Person by Gender and Race in Group 2",
+       x = "Race",
+       y = "Average Workload per Person") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+```
+The distribution of average workloads reveals notable disparities between groups. In Group 1, white males bear the highest average workload, each managing an average of 6 applications. Conversely, Group 2 sees black males shouldering the most substantial workload with an average of 4 applications per person. 
+
+```{r}
+names(edges)
+```
+
+```{r}
+#add the gender, race, and examiner_art_unit for both the ego and alter examiners from the applications dataset to the edges dataset
+
+# Assuming examiner_id is unique within applications, we do not need to group by tenure_days
+applications_profile <- applications %>%
+  select(examiner_id, gender, race, examiner_art_unit) %>%
+  distinct()
+
+# Join for ego examiner info
+edges_info <- edges %>%
+  inner_join(applications_profile, by = c("ego_examiner_id" = "examiner_id")) %>%
+  rename(
+    ego_gender = gender,
+    ego_race = race,
+    ego_examiner_art_unit = examiner_art_unit
+  )
+
+# Now for the alter examiner info. Ensure to use unique names for the second join to avoid overwriting
+edges_info <- edges_info %>%
+  inner_join(applications_profile, by = c("alter_examiner_id" = "examiner_id")) %>%
+  rename(
+    alter_gender = gender,
+    alter_race = race,
+    alter_examiner_art_unit = examiner_art_unit
+  )
+
+# Finally, truncate the art unit codes to their first three characters
+edges_info <- edges_info %>%
+  mutate(
+    ego_examiner_art_unit = substr(ego_examiner_art_unit, 1, 3),
+    alter_examiner_art_unit = substr(alter_examiner_art_unit, 1, 3)
+  )
+
+```
+
+```{r}
+# Filter edges_info for ego_examiner_art_unit equal to "160"
+edges_info_group1 <- edges_info %>%
+  filter(ego_examiner_art_unit == "160")
+```
+
+```{r}
+names(edges_info_group1)
+```
+
+```{r}
+# Create a dataframe of unique examiner IDs with their race
+ego_info <- edges_info_group1 %>%
+  select(ego_examiner_id, ego_race) %>%
+  distinct() %>%
+  rename(examiner_id = ego_examiner_id, race = ego_race)
+
+alter_info <- edges_info_group1 %>%
+  select(alter_examiner_id, alter_race) %>%
+  distinct() %>%
+  rename(examiner_id = alter_examiner_id, race = alter_race)
+
+# Combine ego and alter information, then remove duplicates
+unique_nodes_1 <- bind_rows(ego_info, alter_info) %>%
+  distinct()
+
+# Create the edge list for graph construction
+edge_list_1 <- edges_info_group1 %>%
+  select(ego_examiner_id, alter_examiner_id)
+
+# Create the graph
+g_1 <- graph_from_data_frame(d = edge_list_1, directed = TRUE)
+
+# Extract race information for nodes in the graph
+node_races <- unique_nodes_1$race[match(V(g_1)$name, unique_nodes_1$examiner_id)]
+
+# Define colors for each unique race in the graph
+unique_races <- unique(node_races)
+race_colors <- setNames(hcl.colors(length(unique_races), "Set3"), unique_races)
+
+# Ensure each node's race is set correctly
+V(g_1)$race <- node_races
+
+# Calculate degree centrality for each node
+degree_centrality <- degree(g_1, mode = "all")
+
+# Add the degree centrality as a label for each node
+V(g_1)$label <- degree_centrality
+
+# Plot the graph with labels and race-based colors
+plot(g_1, vertex.color = race_colors[V(g_1)$race], asp = FALSE,
+     main = "Network of Group 1 Examiners by Race", vertex.size = 5,
+     edge.arrow.size = 0.5, vertex.label = V(g_1)$label, vertex.label.color = "black")
+
+# Add a legend to the graph
+legend("topright", legend = names(race_colors), col = race_colors, pch = 19,
+       title = "Race", cex = 0.8, bty = "n")
+```
+
+```{r}
+# Filter edges_info for ego_examiner_art_unit equal to "160"
+edges_info_group2 <- edges_info %>%
+  filter(ego_examiner_art_unit == "170")
+# Create a dataframe of unique examiner IDs with their race
+ego_info_2 <- edges_info_group2 %>%
+  select(ego_examiner_id, ego_race) %>%
+  distinct() %>%
+  rename(examiner_id = ego_examiner_id, race = ego_race)
+
+alter_info_2<- edges_info_group2 %>%
+  select(alter_examiner_id, alter_race) %>%
+  distinct() %>%
+  rename(examiner_id = alter_examiner_id, race = alter_race)
+
+# Combine ego and alter information, then remove duplicates
+unique_nodes_2 <- bind_rows(ego_info_2, alter_info_2) %>%
+  distinct()
+
+# Create the edge list for graph construction
+edge_list_2 <- edges_info_group2 %>%
+  select(ego_examiner_id, alter_examiner_id)
+
+# Create the graph
+g_2 <- graph_from_data_frame(d = edge_list_2, directed = TRUE)
+
+# Extract race information for nodes in the graph
+node_races_2 <- unique_nodes_2$race[match(V(g_2)$name, unique_nodes_2$examiner_id)]
+
+# Define colors for each unique race in the graph
+unique_races_2 <- unique(node_races_2)
+race_colors_2 <- setNames(hcl.colors(length(unique_races_2), "Set3"), unique_races_2)
+
+# Ensure each node's race is set correctly
+V(g_2)$race <- node_races_2
+
+# Calculate degree centrality for each node
+degree_centrality_2 <- degree(g_2, mode = "all")
+
+# Add the degree centrality as a label for each node
+V(g_2)$label <- degree_centrality_2
+
+# Plot the graph with the new layout
+plot(g_2, vertex.color = race_colors_2[V(g_2)$race], asp = FALSE,
+     main = "Network of Group 2 Examiners by Race", vertex.size = 6,
+     edge.arrow.size = 0.1, vertex.label = V(g_2)$label, vertex.label.color = "black")
+
+# Add a legend to the graph
+legend("topright", legend = names(race_colors_2), col = race_colors_2, pch = 19,
+       title = "Race", cex = 0.8, bty = "n")
+```
+
+In the network graphs, each node's color shows the race of the examiner, and the number on the node indicates how many connections, or 'links', they have to others—this is their 'degree centrality'. The higher the number, the more connections they have. We're looking to see if examiners with a lot of connections tend to work more with people of their own race.
+While ego and alter examiners often come from different art units,it seems that examiners tend to connect with others of the same race based on the network graph, especially among white examiners. However, this observation alone isn't enough to conclude a preference for same-race interactions.For instance, in the second group's network graph, there's an Asian examiner with a high number of connections—a centrality score of 341—but most of their connections are with white examiners.Given that white examiners make up a larger portion of the USPTO workforce, as the employee count graph indicates,this might be why we see white examiners linked more often. It's not just about who prefers to work with whom; it's also about how many people there are of each race.
+
+```{r}
+# Count the number of total employees , grouped by race
+employee_totalcount <- applications %>%
+  group_by(race) %>%
+  summarise(count = n_distinct(examiner_id), .groups = 'drop')
+ggplot(employee_totalcount, aes(x = race, y = count, fill = race)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  theme_minimal() +
+  labs(title = "Employee Count by Race ",
+       x = "Race",
+       y = "Count") +
+  scale_fill_brewer(palette = "Pastel1") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+
