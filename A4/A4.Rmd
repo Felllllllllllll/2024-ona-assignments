@@ -1,0 +1,295 @@
+---
+title: "A4"
+output: pdf_document
+date: "2024-04-08"
+---
+```{r}
+library(tidyverse)
+library(lubridate)
+library(arrow)
+data_path <- "/Users/apple/Desktop/Network Analysis/A4/672_project_data/"
+applications <- read_parquet(paste0(data_path,"app_data_sample.parquet"))
+edges <- read_csv(paste0(data_path,"edges_sample.csv"))
+
+```
+### Adding gender to 'applications'based on first name
+```{r}
+library(gender)
+examiner_names <- applications %>%
+        distinct(examiner_name_first)
+
+examiner_names_gender <- examiner_names %>%
+        do(results = gender(.$examiner_name_first, method = "ssa")) %>%
+        unnest(cols = c(results), keep_empty = TRUE) %>%
+        select(
+                examiner_name_first = name,
+                gender,
+                proportion_female)
+
+# remove extra colums from the gender table
+examiner_names_gender <- examiner_names_gender %>%
+        select(examiner_name_first, gender)
+
+# joining gender back to the dataset
+applications <- applications %>%
+        left_join(examiner_names_gender, by = "examiner_name_first")
+
+# cleaning up
+rm(examiner_names)
+rm(examiner_names_gender)
+gc()
+
+
+```
+
+### Adding Race based on last name
+```{r}
+library(wru)
+examiner_surnames <- applications %>%
+        select(surname = examiner_name_last) %>%
+        distinct()
+
+examiner_race <- predict_race(voter.file = examiner_surnames, surname.only = T) %>%
+        as_tibble()
+
+
+examiner_race <- examiner_race %>%
+        mutate(max_race_p = pmax(pred.asi, pred.bla, pred.his, pred.oth, pred.whi)) %>%
+        mutate(race = case_when(
+                max_race_p == pred.asi ~ "Asian",
+                max_race_p == pred.bla ~ "black",
+                max_race_p == pred.his ~ "Hispanic",
+                max_race_p == pred.oth ~ "other",
+                max_race_p == pred.whi ~ "white",
+                TRUE ~ NA_character_
+        ))
+
+# removing extra columns
+examiner_race <- examiner_race %>%
+        select(surname,race)
+
+applications <- applications %>%
+        left_join(examiner_race, by = c("examiner_name_last" = "surname"))
+
+rm(examiner_race)
+rm(examiner_surnames)
+gc()
+
+```
+### Adding tenure days
+```{r}
+library(lubridate) # to work with dates
+
+examiner_dates <- applications %>%
+        select(examiner_id, filing_date, appl_status_date)
+
+examiner_dates <- examiner_dates %>%
+        mutate(start_date = ymd(filing_date), end_date = as_date(dmy_hms(appl_status_date)))
+
+examiner_dates <- examiner_dates %>%
+        group_by(examiner_id) %>%
+        summarise(
+                earliest_date = min(start_date, na.rm = TRUE),
+                latest_date = max(end_date, na.rm = TRUE),
+                tenure_days = interval(earliest_date, latest_date) %/% days(1)
+        ) %>%
+        filter(year(latest_date)<2018)
+
+applications <- applications %>%
+        left_join(examiner_dates, by = "examiner_id")
+
+rm(examiner_dates)
+gc()
+
+```
+
+### The objective is to use linear regression models to explore the impact of network centrality (degree, betweenness, closeness) on the application processing time by USPTO examiners in art unit "161." This focus accounts for the potential variance in processing times across different units due to the unique nature of applications they handle.
+```{r}
+library(tidyverse)
+# Filter the data for workgroup 
+workgroup <- applications %>%
+  filter(substr(examiner_art_unit, 1, 3) == "161")
+
+```
+
+###Calculate the Application Process Time
+First, it filters out rows where both the patent_issue_date and abandon_date are missing (NA). This ensures that the remaining dataset only includes records where at least one of these dates is known, indicating that a final decision has been made on the application.
+
+Next, it combines the patent_issue_date and abandon_date into a new column, decision_date, using the coalesce function. coalesce takes the first non-NA value among its arguments for each row, effectively choosing the patent issue date if available, or the abandon date otherwise. 
+
+Finally,it calculates the difference between the decision_date and filing_date in days for each record, creating a new column app_proc_time to hold this value. This final step provides a numeric representation of the processing time for each patent application, from filing to final decision.
+
+```{r}
+# first filter out rows without NA in both patent_issue_date and abandon_date
+
+filtered_workgroup <- workgroup %>%
+  filter(!(is.na(patent_issue_date) & is.na(abandon_date)))
+
+# next, combine both the columns to form a new column called final_decision_date
+
+filtered_workgroup <- filtered_workgroup %>%
+  mutate(
+    decision_date = coalesce(patent_issue_date, abandon_date)
+  )
+
+# calculate the differences in application processing days
+
+filtered_workgroup <- filtered_workgroup %>%
+  mutate(
+    filing_date = ymd(filing_date), # Convert filing_date to Date format if necessary
+   decision_date = ymd(decision_date) # Convert final_decision_date to Date format if necessary
+  ) %>%
+  mutate(
+    app_proc_time = as.numeric(difftime(decision_date, filing_date, units = "days"))
+  )
+
+```
+
+### Prepare the edge dataset
+The code removes any rows where ego_examiner_id or alter_examiner_id is missin, refining the dataset to only include rows where both ego_examiner_id and alter_examiner_id are present.
+
+Following the cleaning steps, the dataset undergoes a transformation. It's grouped by both ego_examiner_id and alter_examiner_id, creating subsets of data that share these identifiers. Within each subset, the code calculates the number of unique application_number entries, thereby quantifying the number of connections between each pair of ego and alter examiners. 
+```{r}
+library(dplyr)
+
+# Drop rows with NA ego_examiner_id
+edges_cleaned <- edges %>%
+  filter(!is.na(ego_examiner_id))
+
+# Drop rows with NA alter_examiner_id
+edges_cleaned <- edges_cleaned %>%
+  filter(!is.na(alter_examiner_id))
+
+# Transform the data to calculate number of connections
+edges_transformed <- edges_cleaned %>%
+  group_by(ego_examiner_id, alter_examiner_id) %>%
+  summarise(connections = n_distinct(application_number), .groups = "drop") 
+ 
+
+```
+### Calculate centrality measures for each examiner
+```{r}
+library(igraph)
+
+g <- graph_from_data_frame(edges_transformed, directed = FALSE, vertices = NULL)
+
+# Calculate degree centrality
+degree_centrality <- degree(g, mode = "all")
+
+# Calculate betweenness centrality
+betweenness_centrality <- betweenness(g, directed = FALSE)
+
+# Calculate closeness centrality
+closeness_centrality <- closeness(g, mode = "all")
+
+# Combining all centrality measures into a dataframe
+centrality_measures <- data.frame(
+  examiner_id = V(g)$name,
+  degree = degree_centrality,
+  betweenness = betweenness_centrality,
+  closeness = closeness_centrality
+)
+
+# Viewing the first few rows of the centrality measures
+head(centrality_measures)
+
+```
+### Create a Unique examiner Dataset
+By extracting unique examiner attributes and calculating average processing times beforehand, I try to minimize data redundancy. This ensures that each examiner is represented just once in the dataset, making subsequent analyses more straightforward and efficient.
+
+```{r}
+# Extract unique examiner attributes
+unique_examiners <- filtered_workgroup %>%
+  select(examiner_id, examiner_art_unit, race, gender, tenure_days) %>%
+  distinct(examiner_id, .keep_all = TRUE)
+
+# Calculate the average application processing time for each unique examiner
+average_processing_time <- filtered_workgroup %>%
+  group_by(examiner_id) %>%
+  summarise(avg_app_proc_time = mean(app_proc_time, na.rm = TRUE)) %>%
+  ungroup()
+
+# Join the average processing time with the unique examiners data
+unique_examiners <- unique_examiners %>%
+  left_join(average_processing_time, by = "examiner_id")
+
+# View the unique examiners list with average processing time
+print(head(unique_examiners))
+```
+Drop rows with missing values because they pertain to variables that are predictors in a regression analysis.
+
+```{r}
+na_count_by_column <- colSums(is.na(unique_examiners))
+print(na_count_by_column)
+```
+```{r}
+unique_examiners <- na.omit(unique_examiners)
+na_count_by_column <- colSums(is.na(unique_examiners))
+print(na_count_by_column)
+```
+### Merge unique examiners and centrality measures based on examiner id
+```{r}
+
+# Convert examiner_id in unique_examiners_clean to character if it's numeric
+unique_examiners <- unique_examiners %>%
+  mutate(examiner_id = as.character(examiner_id))
+
+# Ensure examiner_id in centrality_measures is also character
+centrality_measures <- centrality_measures %>%
+  mutate(examiner_id = as.character(examiner_id))
+
+# Now perform the inner join
+data <- unique_examiners %>%
+  inner_join(centrality_measures, by = "examiner_id")
+
+# View the first few rows of the combined dataset
+head(data)
+
+```
+### Use linear regression models to estimate the relationship between centrality and `app_proc_time'
+This linear regression model attempts to predict the average processing time (in days) it takes for a U.S. Patent and Trademark Office (USPTO) examiner to process a patent application, using three predictor variables: degree centrality, betweenness centrality, and closeness centrality of the examiners in a network graph.
+
+```{r}
+linear_model <- lm(avg_app_proc_time ~ degree + betweenness + closeness, data = data)
+
+summary(linear_model)
+```
+Coefficients:
+Intercept (1.123e+03): The model estimates that the baseline average processing time, when all predictor variables are zero, is approximately 1123 days. This is a theoretical scenario, given that centrality measures cannot be zero in practice.
+
+Degree (8.853e+00): The coefficient for degree centrality suggests that for each unit increase in degree centrality, the average processing time is expected to increase by about 8.85 days. However, this effect is not statistically significant (p-value = 0.357), meaning we do not have sufficient evidence to confidently say that degree centrality impacts processing time.
+
+Betweenness (-6.761e-04): The negative coefficient for betweenness centrality implies that as an examiner's betweenness centrality increases, their processing time decreases. However, the effect is very small (a unit increase in betweenness centrality decreases processing time by approximately 0.0006761 days), and it is not statistically significant (p-value = 0.873).
+
+Closeness (-7.297e+01): The coefficient for closeness centrality indicates that an increase in closeness centrality is associated with a decrease in average processing time by about 72.97 days. Yet, this relationship is not statistically significant (p-value = 0.802), suggesting uncertainty about the impact of closeness centrality on processing time.
+
+Conclusion:
+The model suggests that, based on the data and variables chosen, centrality measures (degree, betweenness, closeness) do not significantly predict the average processing time for patent applications by USPTO examiners. This could mean that other factors not included in the model might be more influential in determining processing times, or that the relationships between these particular network centrality measures and processing times are complex and not linear. Further investigation with additional variables, different model specifications, or non-linear modeling might provide more insights.
+
+### Does this relationship differ by examiner gender?
+This linear regression model extends the previous analysis by including gender as a predictor and by examining the interactions between gender and each of the centrality measures (degree, betweenness, and closeness) to understand how the relationship between these centrality measures and average application processing time might differ by gender.
+```{r}
+linear_model_2 <- lm(avg_app_proc_time ~ gender+degree + betweenness + closeness+gender*degree+gender*betweenness+gender*closeness , data = data)
+
+summary(linear_model_2)
+```
+Coefficients:
+Intercept (1.139e+03): For the baseline category of gender (assuming female if "male" is specified), the average processing time is estimated to be around 1139 days when all other predictors are zero.
+
+Gendermale (-2.062e+01): Being male is associated with a decrease in average processing time by approximately 20.62 days, compared to being female. However, this difference is not statistically significant (p-value = 0.836).
+
+Degree (1.274e+01): Each unit increase in degree centrality is associated with an increase in average processing time by about 12.74 days, although this effect is not statistically significant (p-value = 0.276).
+
+Betweenness (-5.384e-03): The coefficient for betweenness centrality suggests a small decrease in processing time (around 0.0054 days) for each unit increase in betweenness centrality, but this effect is also not statistically significant (p-value = 0.387).
+
+Closeness (1.913e+03): The positive coefficient for closeness centrality suggests an increase in average processing time by about 1913 days for each unit increase in closeness centrality, which is a large effect but not statistically significant (p-value = 0.214).
+
+Interaction Terms:
+Gendermale:Degree (-1.113e+01): The negative interaction term suggests that the effect of degree centrality on processing time is smaller for males by about 11.13 days compared to females, but this interaction is not statistically significant (p-value = 0.596).
+
+Gendermale:Betweenness (8.762e-03): This positive interaction term indicates that the effect of betweenness centrality on processing time is slightly more positive for males, increasing processing time by approximately 0.0088 days, but this is not significant (p-value = 0.351).
+
+Gendermale:Closeness (-2.053e+03): The negative interaction term suggests that the effect of closeness centrality on processing time decreases for males by about 2053 days compared to females, yet this effect is not statistically significant (p-value = 0.191).
+
+Conclusion:
+The model attempts to explore whether the relationships between centrality measures and average processing time vary by gender. However, none of the main effects or interaction terms are statistically significant, suggesting that, within the limitations of this dataset and model specification, there's no clear evidence that gender modifies the impact of these network centrality measures on processing time. This outcome could mean that either gender does not play a significant role in this context, or the model and available data do not capture the complexities of such relationships effectively. Further investigation with additional data, alternative model specifications, or different variables might provide more insights.
